@@ -6,12 +6,10 @@ use std::net::{SocketAddr, IpAddr};
 use std::str::FromStr;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::{mpsc, oneshot, Mutex};
+use tokio::sync::{mpsc, oneshot, Mutex, Semaphore};
 use tokio::time::{self, Duration, Instant};
 use std::sync::Arc;
-
-// ICMP ping thực tế
-use ping::ping;
+use std::process::Command;
 
 #[derive(Debug, Deserialize)]
 #[serde(tag = "cmd")]
@@ -32,6 +30,7 @@ struct PingStat {
     pass: u64,
     fail: u64,
     disconnected_time: u64, // ms
+    last_ping_time: u64, // timestamp
 }
 
 type SharedStats = Arc<Mutex<HashMap<String, PingStat>>>;
@@ -53,8 +52,14 @@ enum PingTaskControl {
     Stop,
 }
 
+// Semaphore để giới hạn số lượng ping đồng thời
+static PING_SEMAPHORE: tokio::sync::OnceCell<Arc<Semaphore>> = tokio::sync::OnceCell::const_new();
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // Initialize semaphore với 50 concurrent pings
+    PING_SEMAPHORE.set(Arc::new(Semaphore::new(50))).unwrap();
+    
     let listener = TcpListener::bind("127.0.0.1:7878").await?;
     println!("Backend listening on 127.0.0.1:7878");
 
@@ -74,23 +79,37 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 PingControl::Start(ips, interval) => {
                     let mut m = manager_ctrl.lock().await;
                     m.interval = interval;
+                    
                     // Stop các task cũ không còn trong danh sách
                     let new_ips: HashSet<_> = ips.iter().cloned().collect();
                     let old_ips: HashSet<_> = m.tasks.keys().cloned().collect();
+                    
                     for ip in old_ips.difference(&new_ips) {
                         if let Some(tx) = m.tasks.remove(ip) {
                             let _ = tx.send(PingTaskControl::Stop).await;
                         }
                         stats_ctrl.lock().await.remove(ip);
                     }
-                    // Start task mới
+                    
+                    // Start task mới với staggered start để tránh thundering herd
+                    let mut start_delay = 0;
                     for ip in new_ips.difference(&old_ips) {
                         let (tx, rx) = mpsc::channel(1);
                         m.tasks.insert(ip.clone(), tx);
                         let stats = stats_ctrl.clone();
                         let ip_clone = ip.clone();
-                        tokio::spawn(ping_task(ip_clone, interval, stats, rx));
+                        
+                        // Stagger start times để tránh tất cả ping cùng lúc
+                        tokio::spawn(async move {
+                            if start_delay > 0 {
+                                tokio::time::sleep(Duration::from_millis(start_delay)).await;
+                            }
+                            ping_task(ip_clone, interval, stats, rx).await;
+                        });
+                        
+                        start_delay += 10; // Delay 10ms between each task start
                     }
+                    
                     // Update interval cho các task còn lại
                     for ip in new_ips.intersection(&old_ips) {
                         if let Some(tx) = m.tasks.get(ip) {
@@ -144,12 +163,12 @@ async fn handle_client(
     let (reader, mut writer) = socket.into_split();
     let mut reader = BufReader::new(reader).lines();
 
-    // Task gửi kết quả về client mỗi 1s
+    // Task gửi kết quả về client mỗi 500ms để update nhanh hơn
     let stats_send = stats.clone();
     let writer = Arc::new(Mutex::new(writer));
     let writer_send = writer.clone();
     tokio::spawn(async move {
-        let mut send_interval = time::interval(Duration::from_millis(1000));
+        let mut send_interval = time::interval(Duration::from_millis(500));
         loop {
             send_interval.tick().await;
             let stats_guard = stats_send.lock().await;
@@ -167,6 +186,7 @@ async fn handle_client(
         if let Ok(cmd) = serde_json::from_str::<ClientCommand>(&line) {
             match cmd {
                 ClientCommand::Start { ips, interval } => {
+                    println!("Starting ping for {} IPs with interval {}ms", ips.len(), interval);
                     ctrl_tx.send(PingControl::Start(ips, interval))?;
                 }
                 ClientCommand::SetInterval { interval } => {
@@ -194,9 +214,9 @@ async fn handle_client(
 
 fn export_csv(stats: &[PingStat]) -> Result<(), Box<dyn std::error::Error>> {
     let mut file = File::create("ping_stats_export.csv")?;
-    writeln!(file, "ip,pass,fail,disconnected_time")?;
+    writeln!(file, "ip,pass,fail,disconnected_time,last_ping_time")?;
     for s in stats {
-        writeln!(file, "{},{},{},{}", s.ip, s.pass, s.fail, s.disconnected_time)?;
+        writeln!(file, "{},{},{},{},{}", s.ip, s.pass, s.fail, s.disconnected_time, s.last_ping_time)?;
     }
     Ok(())
 }
@@ -210,29 +230,62 @@ async fn ping_task(
     let mut pass = 0u64;
     let mut fail = 0u64;
     let mut disconnected_time = 0u64;
-    let mut last_fail: Option<Instant> = None;
+    let mut last_fail_start: Option<Instant> = None;
     let mut ticker = time::interval(Duration::from_millis(interval));
+    
     let ip_addr = match IpAddr::from_str(&ip) {
         Ok(addr) => addr,
-        Err(_) => return,
+        Err(_) => {
+            eprintln!("Invalid IP address: {}", ip);
+            return;
+        }
     };
+
+    println!("Started ping task for {}", ip);
+    
+    // Initialize stats immediately
+    {
+        let mut stats_guard = stats.lock().await;
+        stats_guard.insert(
+            ip.clone(),
+            PingStat {
+                ip: ip.clone(),
+                pass: 0,
+                fail: 0,
+                disconnected_time: 0,
+                last_ping_time: 0,
+            },
+        );
+    }
+
     loop {
         tokio::select! {
             _ = ticker.tick() => {
-                // Clone ip_addr vì IpAddr không Copy
-                let success = real_ping(&ip_addr);
+                let now = Instant::now();
+                let timestamp = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_secs();
+                
+                // Ping với timeout và semaphore
+                let success = timeout_ping(&ip_addr).await;
+                
                 if success {
                     pass += 1;
-                    last_fail = None;
+                    // Nếu đang trong trạng thái fail, tính disconnected time
+                    if let Some(fail_start) = last_fail_start {
+                        disconnected_time += now.duration_since(fail_start).as_millis() as u64;
+                        last_fail_start = None;
+                    }
                 } else {
                     fail += 1;
-                    let now = Instant::now();
-                    if let Some(last) = last_fail {
-                        disconnected_time += now.duration_since(last).as_millis() as u64;
-                    } else {
-                        last_fail = Some(now);
+                    // Nếu mới bắt đầu fail, lưu thời điểm
+                    if last_fail_start.is_none() {
+                        last_fail_start = Some(now);
                     }
                 }
+
+                // Update stats
                 let mut stats_guard = stats.lock().await;
                 stats_guard.insert(
                     ip.clone(),
@@ -241,6 +294,7 @@ async fn ping_task(
                         pass,
                         fail,
                         disconnected_time,
+                        last_ping_time: timestamp,
                     },
                 );
             }
@@ -249,8 +303,10 @@ async fn ping_task(
                     PingTaskControl::UpdateInterval(new_interval) => {
                         interval = new_interval;
                         ticker = time::interval(Duration::from_millis(interval));
+                        println!("Updated interval for {} to {}ms", ip, interval);
                     }
                     PingTaskControl::Stop => {
+                        println!("Stopped ping task for {}", ip);
                         break;
                     }
                 }
@@ -259,10 +315,44 @@ async fn ping_task(
     }
 }
 
-fn real_ping(ip: &IpAddr) -> bool {
-    // Sử dụng crate ping để gửi ICMP, timeout 1s
-    match ping(*ip, None, None, None, None, None) {
-        Ok(_) => true, // Nếu không lỗi là thành công
+async fn timeout_ping(ip: &IpAddr) -> bool {
+    // Acquire semaphore permit để giới hạn concurrent pings
+    let semaphore = PING_SEMAPHORE.get().unwrap();
+    let _permit = semaphore.acquire().await.unwrap();
+    
+    // Timeout 2 giây cho mỗi ping
+    let timeout_duration = Duration::from_secs(2);
+    
+    match tokio::time::timeout(timeout_duration, async_ping(ip)).await {
+        Ok(result) => result,
+        Err(_) => false, // Timeout
+    }
+}
+
+async fn async_ping(ip: &IpAddr) -> bool {
+    // Chạy ping command trong thread pool để không block
+    let ip_str = ip.to_string();
+    tokio::task::spawn_blocking(move || {
+        system_ping(&ip_str)
+    }).await.unwrap_or(false)
+}
+
+fn system_ping(ip: &str) -> bool {
+    // Sử dụng system ping command thay vì crate ping
+    // Điều này reliable hơn và không bị blocking issues
+    
+    #[cfg(target_os = "windows")]
+    let output = Command::new("ping")
+        .args(&["-n", "1", "-w", "1000", ip])
+        .output();
+    
+    #[cfg(not(target_os = "windows"))]
+    let output = Command::new("ping")
+        .args(&["-c", "1", "-W", "1", ip])
+        .output();
+    
+    match output {
+        Ok(output) => output.status.success(),
         Err(_) => false,
     }
 }

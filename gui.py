@@ -12,6 +12,9 @@ import os
 import sys
 import subprocess
 import platform
+import time
+from collections import deque
+import queue
 
 BACKEND_HOST = '127.0.0.1'
 BACKEND_PORT = 7878
@@ -32,8 +35,23 @@ class PingGUI:
         self.running = False
         self.ip_stats = {}
         self.interval = 1000
+        
+        # Optimization: Batch updates và rate limiting
+        self.update_queue = queue.Queue()
+        self.last_table_update = 0
+        self.update_interval = 1000  # Update table mỗi 1 giây
+        self.stats_buffer = {}
+        self.update_pending = False
+        
+        # Performance tracking
+        self.message_count = 0
+        self.last_message_time = time.time()
+        
         self._build_ui()
         self.root.protocol('WM_DELETE_WINDOW', self.on_close)
+        
+        # Start update scheduler
+        self._start_update_scheduler()
 
     def _build_ui(self):
         # Create main container with padding
@@ -85,6 +103,14 @@ class PingGUI:
             font=('Segoe UI', 10)
         )
         self.connection_label.pack(side=LEFT)
+        
+        # Performance indicator
+        self.perf_label = ttk.Label(
+            self.connection_frame,
+            text="",
+            font=('Segoe UI', 8)
+        )
+        self.perf_label.pack(side=LEFT, padx=(10, 0))
 
     def _create_control_panel(self, parent):
         # Control panel with modern styling
@@ -157,6 +183,20 @@ class PingGUI:
             state='readonly'
         )
         self.interval_combo.pack(side=LEFT, padx=5)
+        ttk.Label(row2, text='ms').pack(side=LEFT, padx=(0, 10))
+        
+        # Update rate setting
+        ttk.Label(row2, text='UI Update:').pack(side=LEFT, padx=(10, 5))
+        self.update_rate_var = tk.StringVar(value='1000')
+        self.update_rate_combo = ttk.Combobox(
+            row2, 
+            textvariable=self.update_rate_var, 
+            values=['500', '1000', '2000', '5000'],
+            width=6,
+            state='readonly'
+        )
+        self.update_rate_combo.pack(side=LEFT, padx=5)
+        self.update_rate_combo.bind('<<ComboboxSelected>>', self.on_update_rate_change)
         ttk.Label(row2, text='ms').pack(side=LEFT, padx=(0, 10))
         
         # Export controls
@@ -246,7 +286,8 @@ class PingGUI:
             master=table_frame,
             coldata=self.columns,
             rowdata=[],
-            paginated=False,
+            paginated=True,
+            pagesize=50,  # Phân trang để tăng performance
             searchable=True,
             autofit=True,
             height=15,
@@ -277,6 +318,49 @@ class PingGUI:
             font=('Segoe UI', 9)
         )
         self.count_label.pack(side=RIGHT)
+
+    def _start_update_scheduler(self):
+        """Start the update scheduler để batch updates"""
+        def update_scheduler():
+            while True:
+                try:
+                    # Update performance metrics
+                    self.root.after(0, self.update_performance_metrics)
+                    
+                    # Check if we need to update table
+                    current_time = time.time() * 1000
+                    if (current_time - self.last_table_update >= self.update_interval and 
+                        self.stats_buffer):
+                        self.root.after(0, self.process_batch_updates)
+                        self.last_table_update = current_time
+                        
+                    time.sleep(0.1)  # Check every 100ms
+                except Exception as e:
+                    print(f"Update scheduler error: {e}")
+                    time.sleep(1)
+        
+        scheduler_thread = threading.Thread(target=update_scheduler, daemon=True)
+        scheduler_thread.start()
+
+    def on_update_rate_change(self, event=None):
+        """Handle update rate change"""
+        try:
+            self.update_interval = int(self.update_rate_var.get())
+            self.status_var.set(f'UI update rate changed to {self.update_interval}ms')
+        except ValueError:
+            self.update_interval = 1000
+            self.update_rate_var.set('1000')
+
+    def update_performance_metrics(self):
+        """Update performance metrics display"""
+        current_time = time.time()
+        time_diff = current_time - self.last_message_time
+        
+        if time_diff >= 1.0:  # Update every second
+            msg_rate = self.message_count / time_diff if time_diff > 0 else 0
+            self.perf_label.config(text=f"({msg_rate:.1f} msg/s)")
+            self.message_count = 0
+            self.last_message_time = current_time
 
     def change_theme(self, theme_name):
         """Change the application theme"""
@@ -317,12 +401,25 @@ class PingGUI:
             messagebox.showerror("Error", f"Failed to open export folder: {e}")
 
     def connect_backend(self):
-        self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        self.sock.connect((BACKEND_HOST, BACKEND_PORT))
-        self.running = True
-        self.recv_thread = threading.Thread(target=self.recv_loop, daemon=True)
-        self.recv_thread.start()
-        self.update_connection_status(True)
+        """Connect to backend with improved error handling"""
+        try:
+            self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            self.sock.settimeout(10)  # 10 second timeout
+            self.sock.connect((BACKEND_HOST, BACKEND_PORT))
+            self.sock.settimeout(None)  # Remove timeout after connection
+            
+            self.running = True
+            self.recv_thread = threading.Thread(target=self.recv_loop, daemon=True)
+            self.recv_thread.start()
+            self.update_connection_status(True)
+            
+            # Reset performance counters
+            self.message_count = 0
+            self.last_message_time = time.time()
+            
+        except Exception as e:
+            self.update_connection_status(False)
+            raise e
 
     def update_connection_status(self, connected):
         """Update the connection status indicator"""
@@ -336,73 +433,109 @@ class PingGUI:
             self.status_var.set('Backend disconnected')
 
     def recv_loop(self):
+        """Optimized receive loop with buffering"""
         buffer = ''
         while self.running:
             try:
-                data = self.sock.recv(4096)
+                data = self.sock.recv(8192)  # Increased buffer size
                 if not data:
                     break
+                    
                 buffer += data.decode('utf-8')
+                
+                # Process multiple messages in batch
+                messages = []
                 while '\n' in buffer:
                     line, buffer = buffer.split('\n', 1)
                     if line.strip():
-                        self.root.after(0, self.handle_backend_msg, line.strip())
+                        messages.append(line.strip())
+                
+                # Process messages in batch
+                if messages:
+                    self.process_messages_batch(messages)
+                    
             except Exception as e:
                 self.root.after(0, self.status_var.set, f'Connection error: {e}')
                 break
+                
         self.root.after(0, self.update_connection_status, False)
         self.running = False
 
-    def handle_backend_msg(self, msg):
-        try:
-            stat = json.loads(msg)
-            ip = stat['ip']
-            self.ip_stats[ip] = stat
-            self.update_table()
-        except Exception:
-            pass
+    def process_messages_batch(self, messages):
+        """Process multiple messages in batch"""
+        for msg in messages:
+            try:
+                stat = json.loads(msg)
+                ip = stat['ip']
+                # Buffer the update instead of immediately updating
+                self.stats_buffer[ip] = stat
+                self.message_count += 1
+            except Exception:
+                continue
+
+    def process_batch_updates(self):
+        """Process buffered updates in batch"""
+        if not self.stats_buffer:
+            return
+            
+        # Update ip_stats with buffered data
+        self.ip_stats.update(self.stats_buffer)
+        
+        # Clear buffer
+        self.stats_buffer.clear()
+        
+        # Update table
+        self.update_table()
 
     def update_table(self):
-        rows = []
-        failed_count = 0
-        
-        for ip, stat in self.ip_stats.items():
-            total = stat['pass'] + stat['fail']
-            if total > 0:
-                percent_pass = f"{(stat['pass']*100/total):.1f}%"
-                percent_fail = f"{(stat['fail']*100/total):.1f}%"
-                fail_rate = (stat['fail']*100/total)
-                
-                # Determine status
-                if fail_rate > 50:
-                    status = "🔴 Critical"
-                    failed_count += 1
-                elif fail_rate > 20:
-                    status = "🟡 Warning"
-                elif fail_rate > 0:
-                    status = "🟢 Good"
-                else:
-                    status = "✅ Perfect"
-            else:
-                percent_pass = percent_fail = 'N/A'
-                status = "⚪ No Data"
+        """Optimized table update"""
+        try:
+            rows = []
+            failed_count = 0
             
-            disconnected = f"{stat['disconnected_time']//1000}"
-            row = (ip, percent_pass, percent_fail, total, disconnected, status)
-            rows.append(row)
-        
-        # Add IPs that haven't been pinged yet
-        for ip in self.ip_list:
-            if ip not in self.ip_stats:
-                rows.append((ip, 'N/A', 'N/A', 0, '0', '⚪ Waiting'))
-        
-        # Update table data
-        self.table.build_table_data(coldata=self.columns, rowdata=rows)
-        
-        # Update status panel
-        active_count = len(self.ip_stats)
-        total_count = len(self.ip_list)
-        self.count_var.set(f'IPs: {total_count} | Active: {active_count} | Failed: {failed_count}')
+            for ip, stat in self.ip_stats.items():
+                total = stat['pass'] + stat['fail']
+                if total > 0:
+                    percent_pass = f"{(stat['pass']*100/total):.1f}%"
+                    percent_fail = f"{(stat['fail']*100/total):.1f}%"
+                    fail_rate = (stat['fail']*100/total)
+                    
+                    # Determine status
+                    if fail_rate > 50:
+                        status = "🔴 Critical"
+                        failed_count += 1
+                    elif fail_rate > 20:
+                        status = "🟡 Warning"
+                    elif fail_rate > 0:
+                        status = "🟢 Good"
+                    else:
+                        status = "✅ Perfect"
+                else:
+                    percent_pass = percent_fail = 'N/A'
+                    status = "⚪ No Data"
+                
+                disconnected = f"{stat['disconnected_time']//1000}"
+                row = (ip, percent_pass, percent_fail, total, disconnected, status)
+                rows.append(row)
+            
+            # Add IPs that haven't been pinged yet
+            for ip in self.ip_list:
+                if ip not in self.ip_stats:
+                    rows.append((ip, 'N/A', 'N/A', 0, '0', '⚪ Waiting'))
+            
+            # Sort rows by IP for consistent display
+            rows.sort(key=lambda x: x[0])
+            
+            # Update table data efficiently
+            self.table.build_table_data(coldata=self.columns, rowdata=rows)
+            
+            # Update status panel
+            active_count = len(self.ip_stats)
+            total_count = len(self.ip_list)
+            self.count_var.set(f'IPs: {total_count} | Active: {active_count} | Failed: {failed_count}')
+            
+        except Exception as e:
+            print(f"Table update error: {e}")
 
     def start_monitor(self):
         if not self.ip_list:
@@ -418,6 +551,7 @@ class PingGUI:
         
         # Clear existing stats
         self.ip_stats.clear()
+        self.stats_buffer.clear()
         self.update_table()
         
         # Remove duplicates
@@ -515,6 +649,7 @@ class PingGUI:
                 if ip in self.ip_list:
                     self.ip_list.remove(ip)
                     self.ip_stats.pop(ip, None)
+                    self.stats_buffer.pop(ip, None)
                     self.status_var.set(f'Removed {ip}. Total: {len(self.ip_list)}')
                     self.update_table()
                 else:
@@ -529,6 +664,7 @@ class PingGUI:
 
     def on_close(self):
         self.stop_monitor()
+        self.running = False
         if self.sock:
             try:
                 self.sock.close()
