@@ -1,3 +1,5 @@
+#![cfg_attr(target_os = "windows", windows_subsystem = "windows")]
+
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::net::{SocketAddr, IpAddr};
@@ -5,7 +7,7 @@ use std::str::FromStr;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{mpsc, oneshot, Mutex, Semaphore};
-use tokio::time::{self, Duration, Instant};
+use tokio::time::{self, Duration};
 use std::sync::Arc;
 use std::process::Command;
 use csv::Writer;
@@ -150,6 +152,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         });
     }
+
+
 }
 
 async fn handle_client(
@@ -212,7 +216,7 @@ async fn handle_client(
 
 async fn export_csv(stats: &[PingStat]) -> Result<(), Box<dyn std::error::Error>> {
     let mut wtr = Writer::from_path("ping_stats_export.csv")?;
-    wtr.write_record(&["IP", "Pass", "Fail", "Disconnected Time (s)", "Last Ping Time"])?;
+    wtr.write_record(&["IP", "Pass", "Fail", "Disconnected Time (ms)", "Last Ping Time"])?;
     
     for stat in stats {
         let last_ping = if stat.last_ping_time > 0 {
@@ -226,7 +230,7 @@ async fn export_csv(stats: &[PingStat]) -> Result<(), Box<dyn std::error::Error>
             stat.ip.as_str(),
             stat.pass.to_string().as_str(),
             stat.fail.to_string().as_str(),
-            (stat.disconnected_time as f64 / 1000.0).to_string().as_str(),
+            stat.disconnected_time.to_string().as_str(),
             last_ping.as_str(),
         ])?;
     }
@@ -243,8 +247,7 @@ async fn ping_task(
 ) {
     let mut pass = 0u64;
     let mut fail = 0u64;
-    let mut disconnected_time = 0u64;
-    let mut last_fail_start: Option<Instant> = None;
+    let disconnected_time = 0u64; // Set to 0 as per requirement
     let mut ticker = time::interval(Duration::from_millis(interval));
     
     let ip_addr = match IpAddr::from_str(&ip) {
@@ -275,7 +278,6 @@ async fn ping_task(
     loop {
         tokio::select! {
             _ = ticker.tick() => {
-                let now = Instant::now();
                 let timestamp = std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
                     .unwrap()
@@ -285,15 +287,8 @@ async fn ping_task(
                 
                 if success {
                     pass += 1;
-                    if let Some(fail_start) = last_fail_start {
-                        disconnected_time += now.duration_since(fail_start).as_millis() as u64;
-                        last_fail_start = None;
-                    }
                 } else {
                     fail += 1;
-                    if last_fail_start.is_none() {
-                        last_fail_start = Some(now);
-                    }
                 }
 
                 let mut stats_guard = stats.lock().await;
