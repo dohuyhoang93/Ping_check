@@ -26,7 +26,12 @@ class PingGUI:
         self.root.geometry('1000x700')
         self.root.minsize(800, 600)
         
-        # Initialize with a modern theme
+        # Set icon for the GUI window
+        if platform.system() == "Windows":
+            icon_path = os.path.join(os.path.dirname(sys.executable), "icon.ico")
+            if os.path.exists(icon_path):
+                self.root.iconbitmap(icon_path)
+        
         self.style = Style('superhero')
         self.current_theme = 'superhero'
         
@@ -35,52 +40,96 @@ class PingGUI:
         self.running = False
         self.ip_stats = {}
         self.interval = 1000
+        self.backend_process = None
         
-        # Optimization: Batch updates and rate limiting
         self.update_queue = queue.Queue()
         self.last_table_update = 0
-        self.update_interval = 1000  # Update table every 1 second
+        self.update_interval = 1000
         self.stats_buffer = {}
         self.update_pending = False
         
-        # Performance tracking
         self.message_count = 0
         self.last_message_time = time.time()
         
-        # Track selected IPs for ping/remove
-        self.selected_ips = {}  # Dictionary: {ip: bool}
+        self.selected_ips = {}
+        self.connection_indicator = None  # Khởi tạo trước để tránh lỗi
         
-        self._build_ui()
+        try:
+            self._build_ui()
+        except Exception as e:
+            print(f"UI build failed: {e}")
+            self.root.destroy()
+            sys.exit(1)
+        
         self.root.protocol('WM_DELETE_WINDOW', self.on_close)
         
-        # Start update scheduler
+        try:
+            self.start_backend()
+        except Exception as e:
+            print(f"Backend start failed: {e}")
+            self.root.destroy()
+            sys.exit(1)
+        
         self._start_update_scheduler()
 
+    def start_backend(self):
+        try:
+            backend_name = "ping_check.exe" if platform.system() == "Windows" else "ping_check"
+            possible_paths = [
+                os.path.join(os.path.dirname(sys.executable), backend_name),
+                os.path.join(os.path.dirname(__file__), backend_name),
+                os.path.join(os.path.dirname(__file__), "target", "release", backend_name)
+            ]
+            backend_path = None
+            for path in possible_paths:
+                if os.path.exists(path):
+                    backend_path = path
+                    break
+            if not backend_path:
+                messagebox.showerror("Error", f"Backend binary '{backend_name}' not found in: {possible_paths}")
+                self.root.destroy()
+                sys.exit(1)
+            
+            print(f"Starting backend: {backend_path}")
+            if self.backend_process and self.backend_process.poll() is None:
+                self.backend_process.terminate()
+                self.backend_process.wait(timeout=2)
+            # Giữ nguyên cách chạy như khi thủ công
+            self.backend_process = subprocess.Popen(
+                [backend_path],
+                creationflags=subprocess.CREATE_NO_WINDOW if platform.system() == "Windows" else 0,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                stdin=subprocess.PIPE,
+                start_new_session=True
+            )
+            time.sleep(1)
+            if self.backend_process.poll() is not None:
+                stderr = self.backend_process.stderr.read().decode()
+                messagebox.showerror("Error", f"Backend process failed: {stderr}")
+                self.root.destroy()
+                sys.exit(1)
+            self.connect_backend()
+        except Exception as e:
+            messagebox.showerror("Error", f"Failed to start backend: {str(e)}")
+            self.root.destroy()
+            sys.exit(1)
+
     def _build_ui(self):
-        # Create main container with padding
         main_frame = ttk.Frame(self.root, padding="10")
         main_frame.pack(fill=BOTH, expand=YES)
 
-        # Header with title and status
         self._create_header(main_frame)
-        
-        # Control panel
         self._create_control_panel(main_frame)
-        
-        # Table with improved styling
         self._create_table(main_frame)
-        
-        # Status bar
         self._create_status_bar(main_frame)
 
-        # IP list
         self.ip_list = []
 
     def _create_header(self, parent):
         header_frame = ttk.Frame(parent)
         header_frame.pack(fill=X, pady=(0, 15))
         
-        # Title
         title_label = ttk.Label(
             header_frame, 
             text="Multi-IP Ping Monitor", 
@@ -88,7 +137,6 @@ class PingGUI:
         )
         title_label.pack(side=LEFT)
         
-        # Connection status indicator
         self.connection_frame = ttk.Frame(header_frame)
         self.connection_frame.pack(side=RIGHT)
         
@@ -107,7 +155,6 @@ class PingGUI:
         )
         self.connection_label.pack(side=LEFT)
         
-        # Performance indicator
         self.perf_label = ttk.Label(
             self.connection_frame,
             text="",
@@ -116,15 +163,12 @@ class PingGUI:
         self.perf_label.pack(side=LEFT, padx=(10, 0))
 
     def _create_control_panel(self, parent):
-        # Control panel with modern styling
         control_frame = ttk.LabelFrame(parent, text="Controls", padding="10")
         control_frame.pack(fill=X, pady=(0, 10))
         
-        # Row 1: Main controls
         row1 = ttk.Frame(control_frame)
         row1.pack(fill=X, pady=(0, 10))
         
-        # Start/Stop buttons
         self.start_btn = ttk.Button(
             row1, 
             text='▶ Start Monitoring', 
@@ -142,11 +186,9 @@ class PingGUI:
         )
         self.stop_btn.pack(side=LEFT, padx=5)
         
-        # Separator
         separator = ttk.Separator(row1, orient='vertical')
         separator.pack(side=LEFT, fill='y', padx=10)
         
-        # IP Management
         self.add_btn = ttk.Button(
             row1, 
             text='➕ Add IP', 
@@ -179,7 +221,6 @@ class PingGUI:
         )
         self.import_btn.pack(side=LEFT, padx=5)
         
-        # Select All/Unselect All buttons
         self.select_all_btn = ttk.Button(
             row1, 
             text='✔ Select All', 
@@ -196,11 +237,9 @@ class PingGUI:
         )
         self.unselect_all_btn.pack(side=LEFT, padx=5)
         
-        # Row 2: Settings and actions
         row2 = ttk.Frame(control_frame)
         row2.pack(fill=X)
         
-        # Interval setting
         ttk.Label(row2, text='Ping Interval:').pack(side=LEFT, padx=(0, 5))
         self.interval_var = tk.StringVar(value='1000')
         self.interval_combo = ttk.Combobox(
@@ -213,7 +252,6 @@ class PingGUI:
         self.interval_combo.pack(side=LEFT, padx=5)
         ttk.Label(row2, text='ms').pack(side=LEFT, padx=(0, 10))
         
-        # Update rate setting
         ttk.Label(row2, text='UI Update:').pack(side=LEFT, padx=(10, 5))
         self.update_rate_var = tk.StringVar(value='1000')
         self.update_rate_combo = ttk.Combobox(
@@ -227,13 +265,11 @@ class PingGUI:
         self.update_rate_combo.bind('<<ComboboxSelected>>', self.on_update_rate_change)
         ttk.Label(row2, text='ms').pack(side=LEFT, padx=(0, 10))
         
-        # Fix dropdown collapsing issue
         def keep_dropdown_open(event, combo):
             combo.focus_set()
         self.interval_combo.bind('<Button-1>', lambda event: keep_dropdown_open(event, self.interval_combo))
         self.update_rate_combo.bind('<Button-1>', lambda event: keep_dropdown_open(event, self.update_rate_combo))
         
-        # Export controls
         self.export_btn = ttk.Button(
             row2, 
             text='💾 Export CSV', 
@@ -250,28 +286,22 @@ class PingGUI:
         )
         self.open_folder_btn.pack(side=LEFT, padx=5)
         
-        # Theme selector
         self._create_theme_menu(row2)
 
     def _create_theme_menu(self, parent):
-        # Theme menu button
         self.theme_var = tk.StringVar(value=self.current_theme)
         theme_menu = ttk.Menubutton(parent, text="🎨 Theme", direction='below')
         theme_menu.pack(side=RIGHT, padx=5)
         
-        # Create theme menu
         theme_menu.menu = tk.Menu(theme_menu, tearoff=0)
         theme_menu['menu'] = theme_menu.menu
         
-        # Get available themes and organize them
         themes = self.style.theme_names()
         
-        # Group themes by type
         dark_themes = ['superhero', 'darkly', 'cyborg', 'vapor', 'solar']
         light_themes = ['cosmo', 'flatly', 'litera', 'minty', 'morph', 'pulse', 'sandstone', 'united', 'yeti']
         colorful_themes = ['cerulean', 'journal', 'lumen', 'lux', 'materia', 'simplex', 'sketchy', 'spacelab']
         
-        # Add dark themes
         theme_menu.menu.add_separator()
         theme_menu.menu.add_command(label="Dark Themes", state="disabled")
         for theme in dark_themes:
@@ -281,7 +311,6 @@ class PingGUI:
                     command=lambda t=theme: self.change_theme(t)
                 )
         
-        # Add light themes
         theme_menu.menu.add_separator()
         theme_menu.menu.add_command(label="Light Themes", state="disabled")
         for theme in light_themes:
@@ -291,7 +320,6 @@ class PingGUI:
                     command=lambda t=theme: self.change_theme(t)
                 )
         
-        # Add colorful themes
         theme_menu.menu.add_separator()
         theme_menu.menu.add_command(label="Colorful Themes", state="disabled")
         for theme in colorful_themes:
@@ -302,11 +330,9 @@ class PingGUI:
                 )
 
     def _create_table(self, parent):
-        # Table frame with better styling
         table_frame = ttk.LabelFrame(parent, text="Ping Statistics", padding="10")
         table_frame.pack(fill=BOTH, expand=YES, pady=(0, 10))
         
-        # Column configuration with checkbox and sequence number
         self.columns = ('select', 'no', 'ip', 'success', 'failure', 'total', 'disconnected', 'last_ping', 'status')
         self.column_configs = {
             'select': {'text': 'Select', 'width': 60, 'anchor': tk.CENTER},
@@ -320,7 +346,6 @@ class PingGUI:
             'status': {'text': 'Status', 'width': 100, 'anchor': tk.CENTER},
         }
         
-        # Create Treeview
         self.table = ttk.Treeview(
             master=table_frame,
             columns=self.columns,
@@ -328,26 +353,21 @@ class PingGUI:
             height=15
         )
         
-        # Configure columns
         for col in self.columns:
             self.table.heading(col, text=self.column_configs[col]['text'], anchor=self.column_configs[col].get('anchor', tk.W))
             self.table.column(col, width=self.column_configs[col]['width'], anchor=self.column_configs[col].get('anchor', tk.W))
         
-        # Add scrollbar
         scrollbar = ttk.Scrollbar(table_frame, orient='vertical', command=self.table.yview)
         self.table.configure(yscrollcommand=scrollbar.set)
         self.table.pack(side=LEFT, fill=BOTH, expand=YES)
         scrollbar.pack(side=RIGHT, fill='y')
         
-        # Bind single-click for checkbox toggle and row selection
         self.table.bind('<ButtonRelease-1>', self.handle_click)
 
     def _create_status_bar(self, parent):
-        # Enhanced status bar
         status_frame = ttk.Frame(parent)
         status_frame.pack(fill=X, pady=(5, 0))
         
-        # Status message
         self.status_var = tk.StringVar(value='Ready - Backend not connected')
         self.status_label = ttk.Label(
             status_frame, 
@@ -356,7 +376,6 @@ class PingGUI:
         )
         self.status_label.pack(side=LEFT, fill=X, expand=YES)
         
-        # Statistics
         self.count_var = tk.StringVar(value='IPs: 0 | Active: 0 | Failed: 0')
         self.count_label = ttk.Label(
             status_frame, 
@@ -366,21 +385,18 @@ class PingGUI:
         self.count_label.pack(side=RIGHT)
 
     def _start_update_scheduler(self):
-        """Start the update scheduler for batch updates"""
         def update_scheduler():
             while True:
                 try:
-                    # Update performance metrics
                     self.root.after(0, self.update_performance_metrics)
                     
-                    # Check if we need to update table
                     current_time = time.time() * 1000
                     if (current_time - self.last_table_update >= self.update_interval and 
                         self.stats_buffer):
                         self.root.after(0, self.process_batch_updates)
                         self.last_table_update = current_time
                         
-                    time.sleep(0.1)  # Check every 100ms
+                    time.sleep(0.1)
                 except Exception as e:
                     print(f"Update scheduler error: {e}")
                     time.sleep(1)
@@ -389,7 +405,6 @@ class PingGUI:
         scheduler_thread.start()
 
     def on_update_rate_change(self, event=None):
-        """Handle update rate change"""
         try:
             self.update_interval = int(self.update_rate_var.get())
             self.status_var.set(f'UI update rate changed to {self.update_interval}ms')
@@ -398,18 +413,16 @@ class PingGUI:
             self.update_rate_var.set('1000')
 
     def update_performance_metrics(self):
-        """Update performance metrics display"""
         current_time = time.time()
         time_diff = current_time - self.last_message_time
         
-        if time_diff >= 1.0:  # Update every second
+        if time_diff >= 1.0:
             msg_rate = self.message_count / time_diff if time_diff > 0 else 0
             self.perf_label.config(text=f"({msg_rate:.1f} msg/s)")
             self.message_count = 0
             self.last_message_time = current_time
 
     def change_theme(self, theme_name):
-        """Change the application theme"""
         try:
             self.style.theme_use(theme_name)
             self.current_theme = theme_name
@@ -418,7 +431,6 @@ class PingGUI:
             messagebox.showerror("Theme Error", f"Failed to change theme: {e}")
 
     def open_export_folder(self):
-        """Open the folder containing exported CSV files"""
         try:
             export_path = os.getcwd()
             csv_file = os.path.join(export_path, "ping_stats_export.csv")
@@ -432,10 +444,10 @@ class PingGUI:
             
             if platform.system() == "Windows":
                 os.startfile(export_path)
-            elif platform.system() == "Darwin":
-                subprocess.run(["open", export_path])
-            else:
+            elif platform.system() == "Linux":
                 subprocess.run(["xdg-open", export_path])
+            else:
+                subprocess.run(["open", export_path])
                 
             self.status_var.set(f"Opened export folder: {export_path}")
             
@@ -443,7 +455,6 @@ class PingGUI:
             messagebox.showerror("Error", f"Failed to open export folder: {e}")
 
     def connect_backend(self):
-        """Connect to backend with improved error handling"""
         try:
             self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             self.sock.settimeout(10)
@@ -463,7 +474,6 @@ class PingGUI:
             raise e
 
     def update_connection_status(self, connected):
-        """Update the connection status indicator"""
         if connected:
             self.connection_indicator.config(foreground="green")
             self.connection_label.config(text="Connected")
@@ -474,7 +484,6 @@ class PingGUI:
             self.status_var.set('Backend disconnected')
 
     def recv_loop(self):
-        """Optimized receive loop with buffering"""
         buffer = ''
         while self.running:
             try:
@@ -489,7 +498,8 @@ class PingGUI:
                     line, buffer = buffer.split('\n', 1)
                     if line.strip():
                         messages.append(line.strip())
-                
+                        print(f"Received: {line.strip()}")
+                        
                 if messages:
                     self.process_messages_batch(messages)
                     
@@ -501,7 +511,6 @@ class PingGUI:
         self.running = False
 
     def process_messages_batch(self, messages):
-        """Process multiple messages in batch"""
         for msg in messages:
             try:
                 stat = json.loads(msg)
@@ -512,7 +521,6 @@ class PingGUI:
                 continue
 
     def process_batch_updates(self):
-        """Process buffered updates in batch"""
         if not self.stats_buffer:
             return
             
@@ -521,7 +529,6 @@ class PingGUI:
         self.update_table()
 
     def toggle_checkbox(self, event, item, ip):
-        """Toggle checkbox state"""
         try:
             self.selected_ips[ip] = not self.selected_ips.get(ip, False)
             self.update_table()
@@ -529,49 +536,41 @@ class PingGUI:
             print(f"Toggle checkbox error: {e}")
 
     def handle_click(self, event):
-        """Handle single click for checkbox toggle and row selection"""
         try:
             item = self.table.identify_row(event.y)
             if not item:
                 return
             
-            # Get column clicked
             column = self.table.identify_column(event.x)
             values = self.table.item(item, 'values')
-            ip = values[2]  # IP is in index 2 (after select, no)
+            ip = values[2]
             
-            if column == '#1':  # Toggle checkbox if clicking on 'select' column
+            if column == '#1':
                 self.toggle_checkbox(event, item, ip)
-            else:  # Select row for other columns
+            else:
                 self.table.selection_set(item)
         except Exception:
             pass
 
     def select_all(self):
-        """Select all IPs"""
         for ip in self.ip_list:
             self.selected_ips[ip] = True
         self.update_table()
         self.status_var.set('Selected all IPs')
 
     def unselect_all(self):
-        """Unselect all IPs"""
         for ip in self.ip_list:
             self.selected_ips[ip] = False
         self.update_table()
         self.status_var.set('Unselected all IPs')
 
     def update_table(self):
-        """Optimized table update with scroll position preservation"""
         try:
-            # Store current scroll position
             scroll_pos = self.table.yview()[0]
             
-            # Clear existing rows
             for item in self.table.get_children():
                 self.table.delete(item)
             
-            # Prepare rows with sequence numbers and checkboxes
             rows = []
             failed_count = 0
             
@@ -601,25 +600,20 @@ class PingGUI:
                 row = (checkbox, idx, ip, percent_pass, percent_fail, total, disconnected, last_ping, status)
                 rows.append(row)
             
-            # Add IPs that haven't been pinged yet
             for ip in self.ip_list:
                 if ip not in self.ip_stats:
                     idx = len(rows) + 1
                     checkbox = '☑' if self.selected_ips.get(ip, False) else '☐'
                     rows.append((checkbox, idx, ip, 'N/A', 'N/A', 0, '0.0', 'N/A', '⚪ Waiting'))
             
-            # Sort rows by IP
             rows.sort(key=lambda x: x[2])
             rows = [(row[0], i+1, *row[2:]) for i, row in enumerate(rows)]
             
-            # Insert rows into Treeview
             for row in rows:
                 self.table.insert('', 'end', values=row)
             
-            # Restore scroll position
             self.table.yview_moveto(scroll_pos)
             
-            # Update status panel
             active_count = len(self.ip_stats)
             total_count = len(self.ip_list)
             self.count_var.set(f'IPs: {total_count} | Active: {active_count} | Failed: {failed_count}')
@@ -632,7 +626,6 @@ class PingGUI:
             messagebox.showwarning('Warning', 'Please add some IPs first!')
             return
             
-        # Get selected IPs for pinging
         ping_ips = [ip for ip in self.ip_list if self.selected_ips.get(ip, False)]
         if not ping_ips:
             messagebox.showwarning('Warning', 'Please select at least one IP to ping!')
@@ -645,15 +638,12 @@ class PingGUI:
                 messagebox.showerror('Error', f'Cannot connect to backend: {e}')
                 return
         
-        # Clear existing stats
         self.ip_stats.clear()
         self.stats_buffer.clear()
         self.update_table()
         
-        # Remove duplicates
         self.ip_list = list(set(self.ip_list))
         
-        # Get interval
         try:
             interval = int(self.interval_var.get())
         except ValueError:
@@ -662,7 +652,6 @@ class PingGUI:
         
         self.interval = interval
         
-        # Send start command with selected IPs
         msg = json.dumps({
             'cmd': 'start',
             'ips': ping_ips,
@@ -678,6 +667,7 @@ class PingGUI:
             messagebox.showerror('Error', f'Failed to send start command: {e}')
 
     def stop_monitor(self):
+        """Send stop command to backend, keep GUI and backend running."""
         if self.running and self.sock:
             try:
                 msg = json.dumps({'cmd': 'stop'}) + '\n'
@@ -704,7 +694,7 @@ class PingGUI:
                     ip = line.strip()
                     if ip and ip not in self.ip_list:
                         self.ip_list.append(ip)
-                        self.selected_ips[ip] = True  # Select new IPs by default
+                        self.selected_ips[ip] = True
                         imported_count += 1
             
             self.status_var.set(f'Imported {imported_count} new IPs. Total: {len(self.ip_list)}')
@@ -733,7 +723,7 @@ class PingGUI:
             ip = ip.strip()
             if ip not in self.ip_list:
                 self.ip_list.append(ip)
-                self.selected_ips[ip] = True  # Select new IP by default
+                self.selected_ips[ip] = True
                 self.status_var.set(f'Added {ip}. Total: {len(self.ip_list)}')
                 self.update_table()
             else:
@@ -741,13 +731,11 @@ class PingGUI:
 
     def remove_ip(self):
         try:
-            # Get selected IPs
             selected_ips = [ip for ip, selected in self.selected_ips.items() if selected]
             if not selected_ips:
                 messagebox.showinfo('Info', 'Please select at least one IP to remove!')
                 return
             
-            # Remove selected IPs
             for ip in selected_ips:
                 if ip in self.ip_list:
                     self.ip_list.remove(ip)
@@ -761,7 +749,6 @@ class PingGUI:
             messagebox.showerror('Error', f'Failed to remove IPs: {e}')
 
     def clear_ip_list(self):
-        """Clear all IPs from the list"""
         if not self.ip_list:
             messagebox.showinfo('Info', 'IP list is already empty!')
             return
@@ -776,6 +763,7 @@ class PingGUI:
             self.update_table()
 
     def on_close(self):
+        """Stop monitoring, terminate backend, and close GUI."""
         self.stop_monitor()
         self.running = False
         if self.sock:
@@ -783,6 +771,15 @@ class PingGUI:
                 self.sock.close()
             except:
                 pass
+        if self.backend_process and self.backend_process.poll() is None:
+            try:
+                self.backend_process.terminate()
+                self.backend_process.wait(timeout=2)
+            except:
+                try:
+                    self.backend_process.kill()
+                except:
+                    pass
         self.root.destroy()
 
 if __name__ == '__main__':

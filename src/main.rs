@@ -1,5 +1,5 @@
 #![cfg_attr(target_os = "windows", windows_subsystem = "windows")]
-
+use std::process::{Command, Stdio};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::net::{SocketAddr, IpAddr};
@@ -9,7 +9,6 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{mpsc, oneshot, Mutex, Semaphore};
 use tokio::time::{self, Duration};
 use std::sync::Arc;
-use std::process::Command;
 use csv::Writer;
 use chrono::{DateTime, Utc};
 
@@ -339,19 +338,49 @@ async fn async_ping(ip: &IpAddr) -> bool {
     }).await.unwrap_or(false)
 }
 
-fn system_ping(ip: &str) -> bool {
-    #[cfg(target_os = "windows")]
-    let output = Command::new("ping")
-        .args(&["-n", "1", "-w", "1000", ip])
-        .output();
+// fn system_ping(ip: &str) -> bool {
+//     #[cfg(target_os = "windows")]
+//     let output = Command::new("ping")
+//         .args(&["-n", "1", "-w", "1000", ip])
+//         .output();
     
-    #[cfg(not(target_os = "windows"))]
-    let output = Command::new("ping")
-        .args(&["-c", "1", "-W", "1", ip])
-        .output();
+//     #[cfg(not(target_os = "windows"))]
+//     let output = Command::new("ping")
+//         .args(&["-c", "1", "-W", "1", ip])
+//         .output();
     
-    match output {
-        Ok(output) => output.status.success(),
-        Err(_) => false,
-    }
+//     match output {
+//         Ok(output) => output.status.success(),
+//         Err(_) => false,
+//     }
+// }
+
+
+
+#[cfg(target_os = "windows")]
+use std::os::windows::process::CommandExt; // Để dùng .creation_flags()
+
+#[cfg(target_os = "windows")]
+pub fn system_ping(ip: &str) -> bool {
+    const CREATE_NO_WINDOW: u32 = 0x08000000;
+
+    let output = Command::new("ping")
+        .args(["-n", "1", "-w", "1000", ip])
+        .creation_flags(CREATE_NO_WINDOW)  // Ngăn mở cửa sổ CMD
+        .stdout(Stdio::null())             // Không in ra stdout
+        .stderr(Stdio::null())             // Không in lỗi ra stderr
+        .output();
+
+    output.map(|o| o.status.success()).unwrap_or(false)
+}
+
+#[cfg(not(target_os = "windows"))]
+pub fn system_ping(ip: &str) -> bool {
+    let output = Command::new("ping")
+        .args(["-c", "1", "-W", "1", ip])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .output();
+
+    output.map(|o| o.status.success()).unwrap_or(false)
 }
