@@ -6,7 +6,6 @@ from tkinter import LEFT, RIGHT, X, BOTH, YES, NORMAL, DISABLED, TOP, BOTTOM
 from tkinter import ttk
 from ttkbootstrap import Style
 from ttkbootstrap.constants import *
-from ttkbootstrap.tableview import Tableview
 from tkinter import filedialog, messagebox, simpledialog
 import os
 import sys
@@ -47,6 +46,9 @@ class PingGUI:
         # Performance tracking
         self.message_count = 0
         self.last_message_time = time.time()
+        
+        # Track selected IPs for ping/remove
+        self.selected_ips = {}  # Dictionary: {ip: bool}
         
         self._build_ui()
         self.root.protocol('WM_DELETE_WINDOW', self.on_close)
@@ -122,7 +124,7 @@ class PingGUI:
         row1 = ttk.Frame(control_frame)
         row1.pack(fill=X, pady=(0, 10))
         
-        # Start/Stop buttons with better styling
+        # Start/Stop buttons
         self.start_btn = ttk.Button(
             row1, 
             text='▶ Start Monitoring', 
@@ -155,11 +157,19 @@ class PingGUI:
         
         self.remove_btn = ttk.Button(
             row1, 
-            text='➖ Remove IP', 
+            text='➖ Remove Selected IPs', 
             command=self.remove_ip,
             bootstyle="warning"
         )
         self.remove_btn.pack(side=LEFT, padx=5)
+        
+        self.clear_btn = ttk.Button(
+            row1, 
+            text='🗑 Clear IP List', 
+            command=self.clear_ip_list,
+            bootstyle="danger"
+        )
+        self.clear_btn.pack(side=LEFT, padx=5)
         
         self.import_btn = ttk.Button(
             row1, 
@@ -168,6 +178,23 @@ class PingGUI:
             bootstyle="secondary"
         )
         self.import_btn.pack(side=LEFT, padx=5)
+        
+        # Select All/Unselect All buttons
+        self.select_all_btn = ttk.Button(
+            row1, 
+            text='✔ Select All', 
+            command=self.select_all,
+            bootstyle="info-outline"
+        )
+        self.select_all_btn.pack(side=LEFT, padx=5)
+        
+        self.unselect_all_btn = ttk.Button(
+            row1, 
+            text='✘ Unselect All', 
+            command=self.unselect_all,
+            bootstyle="warning-outline"
+        )
+        self.unselect_all_btn.pack(side=LEFT, padx=5)
         
         # Row 2: Settings and actions
         row2 = ttk.Frame(control_frame)
@@ -200,9 +227,9 @@ class PingGUI:
         self.update_rate_combo.bind('<<ComboboxSelected>>', self.on_update_rate_change)
         ttk.Label(row2, text='ms').pack(side=LEFT, padx=(0, 10))
         
-        # Fix dropdown collapsing issue by forcing focus
+        # Fix dropdown collapsing issue
         def keep_dropdown_open(event, combo):
-            combo.focus_set()  # Keep focus on combobox to prevent collapse
+            combo.focus_set()
         self.interval_combo.bind('<Button-1>', lambda event: keep_dropdown_open(event, self.interval_combo))
         self.update_rate_combo.bind('<Button-1>', lambda event: keep_dropdown_open(event, self.update_rate_combo))
         
@@ -279,30 +306,41 @@ class PingGUI:
         table_frame = ttk.LabelFrame(parent, text="Ping Statistics", padding="10")
         table_frame.pack(fill=BOTH, expand=YES, pady=(0, 10))
         
-        # Enhanced column configuration with sequence number
-        self.columns = [
-            {'text': 'No.', 'stretch': False, 'width': 50},
-            {'text': 'IP Address', 'stretch': True, 'width': 150},
-            {'text': 'Success %', 'stretch': False, 'width': 80},
-            {'text': 'Failure %', 'stretch': False, 'width': 80},
-            {'text': 'Total Pings', 'stretch': False, 'width': 80},
-            {'text': 'Disconnected (s)', 'stretch': False, 'width': 120},
-            {'text': 'Last Ping', 'stretch': False, 'width': 150},
-            {'text': 'Status', 'stretch': False, 'width': 100},
-        ]
+        # Column configuration with checkbox and sequence number
+        self.columns = ('select', 'no', 'ip', 'success', 'failure', 'total', 'disconnected', 'last_ping', 'status')
+        self.column_configs = {
+            'select': {'text': 'Select', 'width': 60, 'anchor': tk.CENTER},
+            'no': {'text': 'No.', 'width': 50, 'anchor': tk.CENTER},
+            'ip': {'text': 'IP Address', 'width': 150, 'anchor': tk.W},
+            'success': {'text': 'Success %', 'width': 80, 'anchor': tk.CENTER},
+            'failure': {'text': 'Failure %', 'width': 80, 'anchor': tk.CENTER},
+            'total': {'text': 'Total Pings', 'width': 80, 'anchor': tk.CENTER},
+            'disconnected': {'text': 'Disconnected (s)', 'width': 120, 'anchor': tk.CENTER},
+            'last_ping': {'text': 'Last Ping', 'width': 150, 'anchor': tk.CENTER},
+            'status': {'text': 'Status', 'width': 100, 'anchor': tk.CENTER},
+        }
         
-        self.table = Tableview(
+        # Create Treeview
+        self.table = ttk.Treeview(
             master=table_frame,
-            coldata=self.columns,
-            rowdata=[],
-            paginated=False,  # Disable pagination for single page
-            searchable=True,
-            autofit=True,
-            height=15,
-            stripecolor=("#2b2b2b", None)
+            columns=self.columns,
+            show='headings',
+            height=15
         )
-        self.table.pack(fill=BOTH, expand=YES)
-        self.table.bind('<Double-1>', self.on_table_double_click)
+        
+        # Configure columns
+        for col in self.columns:
+            self.table.heading(col, text=self.column_configs[col]['text'], anchor=self.column_configs[col].get('anchor', tk.W))
+            self.table.column(col, width=self.column_configs[col]['width'], anchor=self.column_configs[col].get('anchor', tk.W))
+        
+        # Add scrollbar
+        scrollbar = ttk.Scrollbar(table_frame, orient='vertical', command=self.table.yview)
+        self.table.configure(yscrollcommand=scrollbar.set)
+        self.table.pack(side=LEFT, fill=BOTH, expand=YES)
+        scrollbar.pack(side=RIGHT, fill='y')
+        
+        # Bind single-click for checkbox toggle and row selection
+        self.table.bind('<ButtonRelease-1>', self.handle_click)
 
     def _create_status_bar(self, parent):
         # Enhanced status bar
@@ -382,10 +420,7 @@ class PingGUI:
     def open_export_folder(self):
         """Open the folder containing exported CSV files"""
         try:
-            # Get the directory where the backend is likely running
-            export_path = os.getcwd()  # Current working directory
-            
-            # Check if export file exists
+            export_path = os.getcwd()
             csv_file = os.path.join(export_path, "ping_stats_export.csv")
             if not os.path.exists(csv_file):
                 response = messagebox.askyesno(
@@ -395,12 +430,11 @@ class PingGUI:
                 if not response:
                     return
             
-            # Open file explorer based on OS
             if platform.system() == "Windows":
                 os.startfile(export_path)
-            elif platform.system() == "Darwin":  # macOS
+            elif platform.system() == "Darwin":
                 subprocess.run(["open", export_path])
-            else:  # Linux
+            else:
                 subprocess.run(["xdg-open", export_path])
                 
             self.status_var.set(f"Opened export folder: {export_path}")
@@ -412,16 +446,15 @@ class PingGUI:
         """Connect to backend with improved error handling"""
         try:
             self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            self.sock.settimeout(10)  # 10 second timeout
+            self.sock.settimeout(10)
             self.sock.connect((BACKEND_HOST, BACKEND_PORT))
-            self.sock.settimeout(None)  # Remove timeout after connection
+            self.sock.settimeout(None)
             
             self.running = True
             self.recv_thread = threading.Thread(target=self.recv_loop, daemon=True)
             self.recv_thread.start()
             self.update_connection_status(True)
             
-            # Reset performance counters
             self.message_count = 0
             self.last_message_time = time.time()
             
@@ -445,20 +478,18 @@ class PingGUI:
         buffer = ''
         while self.running:
             try:
-                data = self.sock.recv(8192)  # Increased buffer size
+                data = self.sock.recv(8192)
                 if not data:
                     break
                     
                 buffer += data.decode('utf-8')
                 
-                # Process multiple messages in batch
                 messages = []
                 while '\n' in buffer:
                     line, buffer = buffer.split('\n', 1)
                     if line.strip():
                         messages.append(line.strip())
                 
-                # Process messages in batch
                 if messages:
                     self.process_messages_batch(messages)
                     
@@ -475,7 +506,6 @@ class PingGUI:
             try:
                 stat = json.loads(msg)
                 ip = stat['ip']
-                # Buffer the update instead of immediately updating
                 self.stats_buffer[ip] = stat
                 self.message_count += 1
             except Exception:
@@ -486,23 +516,62 @@ class PingGUI:
         if not self.stats_buffer:
             return
             
-        # Update ip_stats with buffered data
         self.ip_stats.update(self.stats_buffer)
-        
-        # Clear buffer
         self.stats_buffer.clear()
-        
-        # Update table
         self.update_table()
+
+    def toggle_checkbox(self, event, item, ip):
+        """Toggle checkbox state"""
+        try:
+            self.selected_ips[ip] = not self.selected_ips.get(ip, False)
+            self.update_table()
+        except Exception as e:
+            print(f"Toggle checkbox error: {e}")
+
+    def handle_click(self, event):
+        """Handle single click for checkbox toggle and row selection"""
+        try:
+            item = self.table.identify_row(event.y)
+            if not item:
+                return
+            
+            # Get column clicked
+            column = self.table.identify_column(event.x)
+            values = self.table.item(item, 'values')
+            ip = values[2]  # IP is in index 2 (after select, no)
+            
+            if column == '#1':  # Toggle checkbox if clicking on 'select' column
+                self.toggle_checkbox(event, item, ip)
+            else:  # Select row for other columns
+                self.table.selection_set(item)
+        except Exception:
+            pass
+
+    def select_all(self):
+        """Select all IPs"""
+        for ip in self.ip_list:
+            self.selected_ips[ip] = True
+        self.update_table()
+        self.status_var.set('Selected all IPs')
+
+    def unselect_all(self):
+        """Unselect all IPs"""
+        for ip in self.ip_list:
+            self.selected_ips[ip] = False
+        self.update_table()
+        self.status_var.set('Unselected all IPs')
 
     def update_table(self):
         """Optimized table update with scroll position preservation"""
         try:
             # Store current scroll position
-            treeview = self.table.view  # Access underlying Treeview widget
-            scroll_pos = treeview.yview()[0]  # Get current scrollbar position (0.0 to 1.0)
+            scroll_pos = self.table.yview()[0]
             
-            # Prepare all rows with sequence numbers
+            # Clear existing rows
+            for item in self.table.get_children():
+                self.table.delete(item)
+            
+            # Prepare rows with sequence numbers and checkboxes
             rows = []
             failed_count = 0
             
@@ -513,7 +582,6 @@ class PingGUI:
                     percent_fail = f"{(stat['fail']*100/total):.1f}%"
                     fail_rate = (stat['fail']*100/total)
                     
-                    # Determine status
                     if fail_rate > 50:
                         status = "🔴 Critical"
                         failed_count += 1
@@ -527,28 +595,29 @@ class PingGUI:
                     percent_pass = percent_fail = 'N/A'
                     status = "⚪ No Data"
                 
-                disconnected = f"{stat['disconnected_time']/1000:.1f}"  # Convert ms to seconds
-                # Convert last_ping_time to human-readable format
+                disconnected = f"{stat['disconnected_time']/1000:.1f}"
                 last_ping = datetime.fromtimestamp(stat['last_ping_time']).strftime('%Y-%m-%d %H:%M:%S') if stat['last_ping_time'] else 'N/A'
-                row = (idx, ip, percent_pass, percent_fail, total, disconnected, last_ping, status)
+                checkbox = '☑' if self.selected_ips.get(ip, False) else '☐'
+                row = (checkbox, idx, ip, percent_pass, percent_fail, total, disconnected, last_ping, status)
                 rows.append(row)
             
             # Add IPs that haven't been pinged yet
             for ip in self.ip_list:
                 if ip not in self.ip_stats:
                     idx = len(rows) + 1
-                    rows.append((idx, ip, 'N/A', 'N/A', 0, '0.0', 'N/A', '⚪ Waiting'))
+                    checkbox = '☑' if self.selected_ips.get(ip, False) else '☐'
+                    rows.append((checkbox, idx, ip, 'N/A', 'N/A', 0, '0.0', 'N/A', '⚪ Waiting'))
             
-            # Sort rows by IP for consistent display (sequence numbers will be reassigned)
-            rows.sort(key=lambda x: x[1])  # Sort by IP (index 1)
-            # Reassign sequence numbers after sorting
-            rows = [(i+1,) + row[1:] for i, row in enumerate(rows)]
+            # Sort rows by IP
+            rows.sort(key=lambda x: x[2])
+            rows = [(row[0], i+1, *row[2:]) for i, row in enumerate(rows)]
             
-            # Update table data
-            self.table.build_table_data(coldata=self.columns, rowdata=rows)
+            # Insert rows into Treeview
+            for row in rows:
+                self.table.insert('', 'end', values=row)
             
             # Restore scroll position
-            treeview.yview_moveto(scroll_pos)
+            self.table.yview_moveto(scroll_pos)
             
             # Update status panel
             active_count = len(self.ip_stats)
@@ -561,6 +630,12 @@ class PingGUI:
     def start_monitor(self):
         if not self.ip_list:
             messagebox.showwarning('Warning', 'Please add some IPs first!')
+            return
+            
+        # Get selected IPs for pinging
+        ping_ips = [ip for ip in self.ip_list if self.selected_ips.get(ip, False)]
+        if not ping_ips:
+            messagebox.showwarning('Warning', 'Please select at least one IP to ping!')
             return
             
         if not self.running:
@@ -587,10 +662,10 @@ class PingGUI:
         
         self.interval = interval
         
-        # Send start command
+        # Send start command with selected IPs
         msg = json.dumps({
             'cmd': 'start',
-            'ips': self.ip_list,
+            'ips': ping_ips,
             'interval': self.interval
         }) + '\n'
         
@@ -598,7 +673,7 @@ class PingGUI:
             self.sock.sendall(msg.encode('utf-8'))
             self.start_btn.config(state=DISABLED)
             self.stop_btn.config(state=NORMAL)
-            self.status_var.set(f'Monitoring {len(self.ip_list)} IPs...')
+            self.status_var.set(f'Monitoring {len(ping_ips)} IPs...')
         except Exception as e:
             messagebox.showerror('Error', f'Failed to send start command: {e}')
 
@@ -629,6 +704,7 @@ class PingGUI:
                     ip = line.strip()
                     if ip and ip not in self.ip_list:
                         self.ip_list.append(ip)
+                        self.selected_ips[ip] = True  # Select new IPs by default
                         imported_count += 1
             
             self.status_var.set(f'Imported {imported_count} new IPs. Total: {len(self.ip_list)}')
@@ -657,6 +733,7 @@ class PingGUI:
             ip = ip.strip()
             if ip not in self.ip_list:
                 self.ip_list.append(ip)
+                self.selected_ips[ip] = True  # Select new IP by default
                 self.status_var.set(f'Added {ip}. Total: {len(self.ip_list)}')
                 self.update_table()
             else:
@@ -664,24 +741,39 @@ class PingGUI:
 
     def remove_ip(self):
         try:
-            selected = self.table.get_selected_row()
-            if selected:
-                ip = selected[1]  # IP is now in index 1 due to sequence number
+            # Get selected IPs
+            selected_ips = [ip for ip, selected in self.selected_ips.items() if selected]
+            if not selected_ips:
+                messagebox.showinfo('Info', 'Please select at least one IP to remove!')
+                return
+            
+            # Remove selected IPs
+            for ip in selected_ips:
                 if ip in self.ip_list:
                     self.ip_list.remove(ip)
                     self.ip_stats.pop(ip, None)
                     self.stats_buffer.pop(ip, None)
-                    self.status_var.set(f'Removed {ip}. Total: {len(self.ip_list)}')
-                    self.update_table()
-                else:
-                    messagebox.showinfo('Info', f'IP {ip} not found in the list!')
-            else:
-                messagebox.showinfo('Info', 'Please select an IP to remove!')
+                    self.selected_ips.pop(ip, None)
+            
+            self.status_var.set(f'Removed {len(selected_ips)} IPs. Total: {len(self.ip_list)}')
+            self.update_table()
         except Exception as e:
-            messagebox.showerror('Error', f'Failed to remove IP: {e}')
+            messagebox.showerror('Error', f'Failed to remove IPs: {e}')
 
-    def on_table_double_click(self, event):
-        self.remove_ip()
+    def clear_ip_list(self):
+        """Clear all IPs from the list"""
+        if not self.ip_list:
+            messagebox.showinfo('Info', 'IP list is already empty!')
+            return
+            
+        response = messagebox.askyesno('Confirm', 'Clear all IPs from the list?')
+        if response:
+            self.ip_list.clear()
+            self.ip_stats.clear()
+            self.stats_buffer.clear()
+            self.selected_ips.clear()
+            self.status_var.set('Cleared all IPs')
+            self.update_table()
 
     def on_close(self):
         self.stop_monitor()
