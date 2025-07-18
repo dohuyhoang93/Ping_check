@@ -123,90 +123,146 @@ class PingGUI:
             percent_fail = f"{(stat['fail']*100/total):.1f}%" if total > 0 else 'N/A'
             disconnected = f"{stat['disconnected_time']//1000}"
             row = (ip, percent_pass, percent_fail, total, disconnected)
-            # Highlight nếu >50% fail
-            if total > 0 and (stat['fail']*100/total) > 50:
-                self.table.insert_row(row, tags=('fail',))
-            else:
-                rows.append(row)
+            rows.append(row)
+        
+        # Add IPs that haven't been pinged yet
+        for ip in self.ip_list:
+            if ip not in self.ip_stats:
+                rows.append((ip, 'N/A', 'N/A', 0, '0'))
+        
+        # Update table data
         self.table.build_table_data(coldata=self.columns, rowdata=rows)
-        self.table.tag_configure('fail', background='#ffcccc')
+        
         # Update status panel
-        self.count_var.set(f'IPs: {len(self.ip_list)} | Threads: {len(self.ip_stats)}')
+        self.count_var.set(f'IPs: {len(self.ip_list)} | Active: {len(self.ip_stats)}')
 
     def start_monitor(self):
+        if not self.ip_list:
+            messagebox.showwarning('Warning', 'Please add some IPs first!')
+            return
+            
         if not self.running:
             try:
                 self.connect_backend()
             except Exception as e:
-                messagebox.showerror('Error', f'Cannot connect backend: {e}')
+                messagebox.showerror('Error', f'Cannot connect to backend: {e}')
                 return
+        
+        # Clear existing stats
         self.ip_stats.clear()
         self.update_table()
+        
+        # Remove duplicates
         self.ip_list = list(set(self.ip_list))
+        
+        # Get interval
         try:
             interval = int(self.interval_var.get())
-        except Exception:
+        except ValueError:
             interval = 1000
+            self.interval_var.set('1000')
+        
         self.interval = interval
+        
+        # Send start command
         msg = json.dumps({
             'cmd': 'start',
             'ips': self.ip_list,
             'interval': self.interval
         }) + '\n'
-        self.sock.sendall(msg.encode('utf-8'))
-        self.start_btn.config(state=DISABLED)
-        self.stop_btn.config(state=NORMAL)
-        self.status_var.set('Monitoring...')
+        
+        try:
+            self.sock.sendall(msg.encode('utf-8'))
+            self.start_btn.config(state=DISABLED)
+            self.stop_btn.config(state=NORMAL)
+            self.status_var.set('Monitoring...')
+        except Exception as e:
+            messagebox.showerror('Error', f'Failed to send start command: {e}')
 
     def stop_monitor(self):
         if self.running and self.sock:
-            msg = json.dumps({'cmd': 'stop'}) + '\n'
-            self.sock.sendall(msg.encode('utf-8'))
+            try:
+                msg = json.dumps({'cmd': 'stop'}) + '\n'
+                self.sock.sendall(msg.encode('utf-8'))
+            except Exception as e:
+                print(f"Error stopping monitor: {e}")
+        
         self.start_btn.config(state=NORMAL)
         self.stop_btn.config(state=DISABLED)
         self.status_var.set('Stopped')
 
     def import_ips(self):
-        path = filedialog.askopenfilename(filetypes=[('Text Files', '*.txt')])
+        path = filedialog.askopenfilename(
+            title='Import IP List',
+            filetypes=[('Text Files', '*.txt'), ('All Files', '*.*')]
+        )
         if not path:
             return
-        with open(path, 'r') as f:
-            for line in f:
-                ip = line.strip()
-                if ip and ip not in self.ip_list:
-                    self.ip_list.append(ip)
-        self.status_var.set(f'Imported {len(self.ip_list)} IPs')
-        self.update_table()
+        
+        try:
+            with open(path, 'r') as f:
+                imported_count = 0
+                for line in f:
+                    ip = line.strip()
+                    if ip and ip not in self.ip_list:
+                        self.ip_list.append(ip)
+                        imported_count += 1
+            
+            self.status_var.set(f'Imported {imported_count} new IPs. Total: {len(self.ip_list)}')
+            self.update_table()
+        except Exception as e:
+            messagebox.showerror('Error', f'Failed to import IPs: {e}')
 
     def export_csv(self):
-        if self.running and self.sock:
+        if not self.running or not self.sock:
+            messagebox.showwarning('Warning', 'Backend not connected!')
+            return
+            
+        try:
             msg = json.dumps({'cmd': 'export'}) + '\n'
             self.sock.sendall(msg.encode('utf-8'))
             messagebox.showinfo('Export', 'Export command sent to backend. File will be saved as ping_stats_export.csv')
+        except Exception as e:
+            messagebox.showerror('Error', f'Failed to send export command: {e}')
 
     def switch_theme(self):
         themes = self.style.theme_names()
         current = self.style.theme.name
-        idx = themes.index(current)
-        next_theme = themes[(idx+1)%len(themes)]
-        self.style.theme_use(next_theme)
+        try:
+            idx = themes.index(current)
+            next_theme = themes[(idx + 1) % len(themes)]
+            self.style.theme_use(next_theme)
+            self.status_var.set(f'Theme changed to: {next_theme}')
+        except Exception as e:
+            print(f"Error switching theme: {e}")
 
     def add_ip(self):
         ip = simpledialog.askstring('Add IP', 'Enter IP address:')
-        if ip and ip not in self.ip_list:
-            self.ip_list.append(ip)
-            self.status_var.set(f'Added {ip}')
-            self.update_table()
+        if ip and ip.strip():
+            ip = ip.strip()
+            if ip not in self.ip_list:
+                self.ip_list.append(ip)
+                self.status_var.set(f'Added {ip}. Total: {len(self.ip_list)}')
+                self.update_table()
+            else:
+                messagebox.showinfo('Info', f'IP {ip} already exists in the list!')
 
     def remove_ip(self):
-        selected = self.table.get_selected_row()
-        if selected:
-            ip = selected[0]
-            if ip in self.ip_list:
-                self.ip_list.remove(ip)
-                self.ip_stats.pop(ip, None)
-                self.status_var.set(f'Removed {ip}')
-                self.update_table()
+        try:
+            selected = self.table.get_selected_row()
+            if selected:
+                ip = selected[0]
+                if ip in self.ip_list:
+                    self.ip_list.remove(ip)
+                    self.ip_stats.pop(ip, None)
+                    self.status_var.set(f'Removed {ip}. Total: {len(self.ip_list)}')
+                    self.update_table()
+                else:
+                    messagebox.showinfo('Info', f'IP {ip} not found in the list!')
+            else:
+                messagebox.showinfo('Info', 'Please select an IP to remove!')
+        except Exception as e:
+            messagebox.showerror('Error', f'Failed to remove IP: {e}')
 
     def on_table_double_click(self, event):
         self.remove_ip()
