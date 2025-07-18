@@ -3,7 +3,7 @@
 A simple multithreaded Rust program to check network reachability of multiple IP addresses using `ping`.
 
 <p align="center">
-  <img src="./docs/assets/images/screenshot.png" alt="screenshot" width="700">
+  <img src="./docs/assets/images/screenshot.PNG" alt="screenshot" width="700">
 </p>
 
 ---
