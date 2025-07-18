@@ -200,6 +200,12 @@ class PingGUI:
         self.update_rate_combo.bind('<<ComboboxSelected>>', self.on_update_rate_change)
         ttk.Label(row2, text='ms').pack(side=LEFT, padx=(0, 10))
         
+        # Fix dropdown collapsing issue by forcing focus
+        def keep_dropdown_open(event, combo):
+            combo.focus_set()  # Keep focus on combobox to prevent collapse
+        self.interval_combo.bind('<Button-1>', lambda event: keep_dropdown_open(event, self.interval_combo))
+        self.update_rate_combo.bind('<Button-1>', lambda event: keep_dropdown_open(event, self.update_rate_combo))
+        
         # Export controls
         self.export_btn = ttk.Button(
             row2, 
