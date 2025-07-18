@@ -15,7 +15,6 @@ import platform
 import time
 from collections import deque
 import queue
-from datetime import datetime
 
 BACKEND_HOST = '127.0.0.1'
 BACKEND_PORT = 7878
@@ -37,10 +36,10 @@ class PingGUI:
         self.ip_stats = {}
         self.interval = 1000
         
-        # Optimization: Batch updates and rate limiting
+        # Optimization: Batch updates và rate limiting
         self.update_queue = queue.Queue()
         self.last_table_update = 0
-        self.update_interval = 1000  # Update table every 1 second
+        self.update_interval = 1000  # Update table mỗi 1 giây
         self.stats_buffer = {}
         self.update_pending = False
         
@@ -273,15 +272,13 @@ class PingGUI:
         table_frame = ttk.LabelFrame(parent, text="Ping Statistics", padding="10")
         table_frame.pack(fill=BOTH, expand=YES, pady=(0, 10))
         
-        # Enhanced column configuration with sequence number
+        # Enhanced column configuration
         self.columns = [
-            {'text': 'No.', 'stretch': False, 'width': 50},
             {'text': 'IP Address', 'stretch': True, 'width': 150},
             {'text': 'Success %', 'stretch': False, 'width': 80},
             {'text': 'Failure %', 'stretch': False, 'width': 80},
             {'text': 'Total Pings', 'stretch': False, 'width': 80},
             {'text': 'Disconnected (s)', 'stretch': False, 'width': 120},
-            {'text': 'Last Ping', 'stretch': False, 'width': 150},
             {'text': 'Status', 'stretch': False, 'width': 100},
         ]
         
@@ -289,7 +286,8 @@ class PingGUI:
             master=table_frame,
             coldata=self.columns,
             rowdata=[],
-            paginated=False,  # Disable pagination for single page
+            paginated=True,
+            pagesize=50,  # Phân trang để tăng performance
             searchable=True,
             autofit=True,
             height=15,
@@ -322,7 +320,7 @@ class PingGUI:
         self.count_label.pack(side=RIGHT)
 
     def _start_update_scheduler(self):
-        """Start the update scheduler for batch updates"""
+        """Start the update scheduler để batch updates"""
         def update_scheduler():
             while True:
                 try:
@@ -490,17 +488,12 @@ class PingGUI:
         self.update_table()
 
     def update_table(self):
-        """Optimized table update with scroll position preservation"""
+        """Optimized table update"""
         try:
-            # Store current scroll position
-            treeview = self.table.view  # Access underlying Treeview widget
-            scroll_pos = treeview.yview()[0]  # Get current scrollbar position (0.0 to 1.0)
-            
-            # Prepare all rows with sequence numbers
             rows = []
             failed_count = 0
             
-            for idx, (ip, stat) in enumerate(self.ip_stats.items(), 1):
+            for ip, stat in self.ip_stats.items():
                 total = stat['pass'] + stat['fail']
                 if total > 0:
                     percent_pass = f"{(stat['pass']*100/total):.1f}%"
@@ -521,28 +514,20 @@ class PingGUI:
                     percent_pass = percent_fail = 'N/A'
                     status = "⚪ No Data"
                 
-                disconnected = f"{stat['disconnected_time']/1000:.1f}"  # Convert ms to seconds
-                # Convert last_ping_time to human-readable format
-                last_ping = datetime.fromtimestamp(stat['last_ping_time']).strftime('%Y-%m-%d %H:%M:%S') if stat['last_ping_time'] else 'N/A'
-                row = (idx, ip, percent_pass, percent_fail, total, disconnected, last_ping, status)
+                disconnected = f"{stat['disconnected_time']//1000}"
+                row = (ip, percent_pass, percent_fail, total, disconnected, status)
                 rows.append(row)
             
             # Add IPs that haven't been pinged yet
             for ip in self.ip_list:
                 if ip not in self.ip_stats:
-                    idx = len(rows) + 1
-                    rows.append((idx, ip, 'N/A', 'N/A', 0, '0.0', 'N/A', '⚪ Waiting'))
+                    rows.append((ip, 'N/A', 'N/A', 0, '0', '⚪ Waiting'))
             
-            # Sort rows by IP for consistent display (sequence numbers will be reassigned)
-            rows.sort(key=lambda x: x[1])  # Sort by IP (index 1)
-            # Reassign sequence numbers after sorting
-            rows = [(i+1,) + row[1:] for i, row in enumerate(rows)]
+            # Sort rows by IP for consistent display
+            rows.sort(key=lambda x: x[0])
             
-            # Update table data
+            # Update table data efficiently
             self.table.build_table_data(coldata=self.columns, rowdata=rows)
-            
-            # Restore scroll position
-            treeview.yview_moveto(scroll_pos)
             
             # Update status panel
             active_count = len(self.ip_stats)
@@ -660,7 +645,7 @@ class PingGUI:
         try:
             selected = self.table.get_selected_row()
             if selected:
-                ip = selected[1]  # IP is now in index 1 due to sequence number
+                ip = selected[0]
                 if ip in self.ip_list:
                     self.ip_list.remove(ip)
                     self.ip_stats.pop(ip, None)
